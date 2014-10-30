@@ -3,3 +3,4 @@
   + Add/Remove your application to supervisord
   + Add/Remove (nginx or firewalld or iptables) configuration for your application
   + Create/Drop Database for your application
+  + Let supervisord auto start. By: systemctl or chkconfig or update-rc.d
