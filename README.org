@@ -1,0 +1,6 @@
+
+* Features
+  + Add/Remove your application to supervisord
+  + Add/Remove nginx or firewalld configuration for your application
+  + Create/Drop Database for your application
+
