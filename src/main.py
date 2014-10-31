@@ -21,21 +21,34 @@ def parse_args():
 
     parser_init.add_argument('-c', '--cfg', metavar='FILE', required=True, help='Supervisord config file(template) path.')
     parser_init.add_argument('-d', '--dir', metavar='DIR', required=True, help='Where you place supervisord files.')
-    
-    for p in (parser_init, parser_destory):
-        p.add_argument('-t', '--target', metavar='FILE', default='/etc/supervisord.conf', help='(optional) Target global supervisord config file')
         
     for p in (parser_install, parser_uninstall, parser_update):
         p.add_argument('-c', '--cfg', metavar='FILE', required=True, help='Program config file path.')
+    
+    for p in (parser_init, parser_destory, parser_install, parser_uninstall, parser_update):
+        p.add_argument('-t', '--target', metavar='FILE', default='/etc/supervisord.conf',
+                       help='(optional) Target global supervisord config file')
 
     args = parser.parse_args()
     return args
 
 class Permit(object):
+    """ Ask the user whether can continue actions.
+    
+       $ Can I continue doing things? [Y/N/A]:
+    
+    """
     last = None
     
     def __init__(self, msg):
         self.msg = msg
+
+    @staticmethod
+    def reset():
+        Permit.last = None
+
+    def reset(self):
+        Permit.reset()
 
     def check(self, y=True, n=True, All=False):
         if Permit.last == 'a':
@@ -117,9 +130,8 @@ def cfg_nginx(ngx_kwargs, directory, link_directory=None, tmpl_file=None):
 
     if link_directory:
         file_link = os.path.join(link_directory, filename)
-        os.system('ln -s %(file_path)s %(file_link)s' % locals())
-        
-    
+
+
 def cfg_supervisor(): pass
 def cfg_firewall(): pass
 
@@ -161,6 +173,21 @@ def check_args(args):
         if not os.path.isfile(args.cfg):
             raise ValueError('Invalid config file: %s' % args.cfg)
 
+def get_dealer_dir(target):
+    conf = parse_conf(target)
+    dealer_dir = None
+    for section, item in (('unix_http_server', 'file'), ('supervisord', 'pidfile')):
+        try:
+            sock_file = conf.get(section, item)
+            dealer_dir, _ = os.path.split(sock_file)
+            break
+        except ConfigParser.NoSectionError:
+            pass
+    if dealer_dir is None:
+        raise ValueError('Can not find the dealer directory!')
+    return dealer_dir
+
+
 def init(args):
     """
     Steps:
@@ -191,21 +218,18 @@ def destory(args):
       * Remove dealer directory
       * Remove /etc/supervisord.conf
     """
-    conf = parse_conf(args.target)
-    sock_file = conf.get('unix_http_server', 'file')
-    dealerdir, _ = os.path.split(sock_file)
-
-    if not os.path.exists(dealerdir):
-        raise ValueError('Dealer directory %s not found!' % dealerdir)
+    dealer_dir = get_dealer_dir(args.target)
+    if not os.path.exists(dealer_dir):
+        raise ValueError('Dealer directory %s not found!' % dealer_dir)
     Permit('''    1. Shutdown supervisord;
     2. remove dealer directory: {};
     3. Remove supervisord config file: {}
-    >> ? '''.format(dealerdir, args.target)).check()
+    >> ? '''.format(dealer_dir, args.target)).check()
     print_step('Shutdown supervisord')
     os.system('supervisorctl -c {} shutdown'.format(args.target))
     
-    print_step('Remove dealer directory: %s' % dealerdir)
-    os.system('rm -r {}'.format(dealerdir))
+    print_step('Remove dealer directory: %s' % dealer_dir)
+    os.system('rm -r {}'.format(dealer_dir))
     
     print_step('Remove supervisord config file: %s' % args.target)
     os.remove(args.target)
@@ -223,7 +247,8 @@ def install(args):
       * Reload supervisord
       * Reload nginx
     """
-    pass
+    conf = parse_conf(args.target)
+    
 
 
 def uninstall(args):
