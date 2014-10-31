@@ -3,6 +3,7 @@
 
 import os
 import sys
+import getpass
 import argparse
 import ConfigParser
 
@@ -18,11 +19,11 @@ def parse_args():
     parser_uninstall = subparsers.add_parser('uninstall', help='Uninstall the application')
     parser_update    = subparsers.add_parser('update', help='Update the application')
 
-    parser_init.add_argument('-c', '--cfg', metavar='FILE', required=True, help='Supervisord config file path.')
+    parser_init.add_argument('-c', '--cfg', metavar='FILE', required=True, help='Supervisord config file(template) path.')
+    parser_init.add_argument('-d', '--dir', metavar='DIR', required=True, help='Where you place supervisord files.')
     
     for p in (parser_init, parser_destory):
-        p.add_argument('-d', '--dir', metavar='DIR', required=True, help='Where you place supervisord files.')
-        p.add_argument('-t', '--target', metavar='FILE', default='/etc/supervisord.conf', help='Target global supervisord config file')
+        p.add_argument('-t', '--target', metavar='FILE', default='/etc/supervisord.conf', help='(optional) Target global supervisord config file')
         
     for p in (parser_install, parser_uninstall, parser_update):
         p.add_argument('-c', '--cfg', metavar='FILE', required=True, help='Program config file path.')
@@ -30,8 +31,31 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+class Permit(object):
+    last = None
+    
+    def __init__(self, msg):
+        self.msg = msg
+
+    def check(self, y=True, n=True, All=False):
+        if Permit.last == 'a':
+            return True
+
+        options = filter(lambda opt: opt[0], [(y, 'Y'), (n, 'N'), (All, 'A')])
+        option_answers = [opt[1].lower() for opt in options]
+        options_msg = '[{}]'.format('/'.join([opt[1] for opt in options]))
+        answer = None
+        while answer not in option_answers:
+            answer = raw_input('{} {}:'.format(self.msg, options_msg)).lower()
+
+        if answer == 'n':
+            print >> sys.stderr, '[Abort]'
+            sys.exit(-1)
+        Permit.last = answer
+
+
 def print_step(msg):
-    print '  * %s ...' % msg
+    print '  * .... %s' % msg
     
 # ==============================================================================
 #  ConfigParser stuffs
@@ -70,13 +94,42 @@ def parse_conf(path):
     return conf
 
 
-def build_nginx_cfg(): pass
-def build_supervisor_cfg(): pass
+# ==============================================================================
+#  Config (nginx, supervisor, firewall) things.
+# ==============================================================================    
+def cfg_nginx(ngx_kwargs, directory, link_directory=None, tmpl_file=None):
+    ngx_tmpl = '''
+    server {
+        listen       {{ listen }};
+        server_name  {{ server_name }};
+    
+        location {{ location }} {
+            proxy_pass {{ proxy_pass }};
+        }
+    }
+    '''
+    filename = '%(server_name)s_%(listen)s.conf' % ngx_kwargs
+    file_path = os.path.join(directory, filename)
+    if tmpl_file:
+        with open(tmpl_file, 'r') as f:
+            ngx_tmpl = f.read()
+    jinja2.Template(ngx_tmpl).stream(**ngx_kwargs).dump(file_path)
 
+    if link_directory:
+        file_link = os.path.join(link_directory, filename)
+        os.system('ln -s %(file_path)s %(file_link)s' % locals())
+        
+    
 def cfg_supervisor(): pass
-def cfg_nginx(): pass
 def cfg_firewall(): pass
 
+def decfg_nginx(): pass
+def decfg_firewall(): pass
+def decfg_supervisor(): pass
+
+# ==============================================================================
+#  Init databases
+# ==============================================================================
 def init_db_postgres(): pass
 def init_db_mysql(): pass
 def init_db_sqlite(): pass
@@ -96,9 +149,13 @@ def check_args(args):
     
     if args.action == 'init':
         if os.path.exists(args.dir):
-            raise ValueError('Directory %s already exists!' % args.dir)
+            raise ValueError('Dealer directory %s already exists!' % args.dir)
         if os.path.exists(args.target):
             raise ValueError('Target file %s already exists' % args.target)
+
+    if args.action == 'destory':
+        if not os.path.exists(args.target):
+            raise ValueError('Target file %s not found' % args.target)
 
     if args.action in ('init', 'install', 'uninstall', 'update'):
         if not os.path.isfile(args.cfg):
@@ -122,7 +179,7 @@ def init(args):
         template.stream(dir=args.dir).dump(args.target)
 
     print_step('Start supervisord')
-    os.system('supervisord')
+    os.system('supervisord -c {}'.format(args.target))
 
 
 def destory(args):
@@ -130,18 +187,36 @@ def destory(args):
     Steps:
     ======
       * Uninstall all programs
-      * Stop supervisord
-      * Remove all supervisord directories
+      * Shutdown supervisord
+      * Remove dealer directory
       * Remove /etc/supervisord.conf
     """
-    pass
+    conf = parse_conf(args.target)
+    sock_file = conf.get('unix_http_server', 'file')
+    dealerdir, _ = os.path.split(sock_file)
+
+    if not os.path.exists(dealerdir):
+        raise ValueError('Dealer directory %s not found!' % dealerdir)
+    Permit('''    1. Shutdown supervisord;
+    2. remove dealer directory: {};
+    3. Remove supervisord config file: {}
+    >> ? '''.format(dealerdir, args.target)).check()
+    print_step('Shutdown supervisord')
+    os.system('supervisorctl -c {} shutdown'.format(args.target))
+    
+    print_step('Remove dealer directory: %s' % dealerdir)
+    os.system('rm -r {}'.format(dealerdir))
+    
+    print_step('Remove supervisord config file: %s' % args.target)
+    os.remove(args.target)
+
 
 def install(args):
     """
     Steps:
     ======
       * Parse supervisord directory from /etc/supervisord.conf
-      * Put [APP].conf to [supervisord-dir]/programs/[APP].conf
+      * Copy [APP].conf to [supervisord-dir]/programs/
       * (optional) Add config to nginx
       * (optional) Add config to firewall
       * (optional) Init database: create database, create tables, other SQL.
@@ -156,7 +231,7 @@ def uninstall(args):
     Steps:
     ======
       * Parse supervisord directory from /etc/supervisord.conf
-      * Remove [supervisord-dir]/programs/[APP].conf
+      * Remove [APP].conf from [supervisord-dir]/programs/
       * (optional) Remove config from nginx
       * (optional) Remove config from firewall
       * Database: do not do anything !!!
@@ -184,9 +259,15 @@ def update(args):
 def main():
     args = parse_args()
     print args
-    check_args(args)
-    globals()[args.action](args)
-    print '>>> DONE!'
+    print '='*40
+    assert getpass.getuser() == 'root', 'Permission denied!'
+    try:
+        check_args(args)
+        globals()[args.action](args)
+        print '='*40
+        print '>>> DONE!'
+    except ValueError as e:
+        print '[ERROR] :: %r' % e
 
 
 if __name__ == '__main__':
