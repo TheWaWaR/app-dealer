@@ -9,6 +9,18 @@ import ConfigParser
 
 import jinja2
 
+PROGRAMS_DIR = 'programs'
+NGX_SERVER_TMPL = '''
+server {
+    listen       {{ listen }};
+    server_name  {{ server_name }};
+
+    location {{ location }} {
+        proxy_pass {{ proxy_pass }};
+    }
+}
+'''
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -20,7 +32,8 @@ def parse_args():
     parser_update    = subparsers.add_parser('update', help='Update the application')
 
     parser_init.add_argument('-c', '--cfg', metavar='FILE', required=True, help='Supervisord config file(template) path.')
-    parser_init.add_argument('-d', '--dir', metavar='DIR', required=True, help='Where you place supervisord files.')
+    parser_init.add_argument('-d', '--dir', metavar='DIR', required=True, help='Where you place dealer files.')
+    parser_destory.add_argument('-d', '--dir', metavar='DIR', default=None, help='(optional) Where you place dealer files.')
         
     for p in (parser_install, parser_uninstall, parser_update):
         p.add_argument('-c', '--cfg', metavar='FILE', required=True, help='Program config file path.')
@@ -35,6 +48,8 @@ def parse_args():
 class Permit(object):
     """ Ask the user whether can continue actions.
     
+    Example:
+    ========
        $ Can I continue doing things? [Y/N/A]:
     
     """
@@ -73,23 +88,9 @@ def print_step(msg):
 # ==============================================================================
 #  ConfigParser stuffs
 # ==============================================================================
-def get_programs(conf_path):
-    conf = parse_conf(conf_path)
-    programs = parse_programs(conf)
-    try:
-        files = conf.get('include', 'files')
-        s_path, s_name = os.path.split(conf_path)
-        programs.extend(parse_include(s_path, files))
-    except ConfigParser.NoSectionError:
-        pass
-    return programs
-
 def parse_programs(conf):
-    lst = []
-    for section in conf.sections():
-        if section.startswith('program:'):
-            lst.append(section.split(':')[1])
-    return lst
+    return [section.split(':')[1] for section in conf.sections()
+            if section.startswith('program:')]
 
 def parse_include(path, files):
     lst = []
@@ -109,50 +110,258 @@ def parse_conf(path):
 
 # ==============================================================================
 #  Config (nginx, supervisor, firewall) things.
-# ==============================================================================    
-def cfg_nginx(ngx_kwargs, directory, link_directory=None, tmpl_file=None):
-    ngx_tmpl = '''
-    server {
-        listen       {{ listen }};
-        server_name  {{ server_name }};
+# ==============================================================================
+class Dealer(object):
+
+    def __init__(self, action, args):
+        self.action = action
+        self.args = args
+
+    def process(self):
+        conf = parse_conf(self.args.target)
+        getattr(self, self.action)()
+
+    def init(self):
+        """ See: Supervisor.init() """
+        Supervisor(self.args.target).init(self.args.dir, self.args.cfg)
+
+    def destory(self):
+        """ See: Supervisor.destory() """
+        Supervisor(self.args.target).destory(self.args.dir)
+
+    def install(self):
+        """
+        Steps:
+        ======
+          * Parse supervisord directory from /etc/supervisord.conf
+          * Copy [APP].conf to [supervisord-dir]/programs/
+          * (optional) Add config to nginx
+          * (optional) Add config to firewall
+          * (optional) Init database: create database, create tables, other SQL.
+          * Reload supervisord
+          * Reload nginx
+        """
+        conf = parse_conf(self.args.cfg)
+        prog_name = parse_programs(conf)[0]
+        section_program = conf.items('program:{}'.format(prog_name))
+        supervisor = Supervisor(self.args.target)
+        supervisor.install(prog_name, section_program)
+
+        nginx, firewall, database = None, None, None
+        if conf.has_section('nginx'):
+            kwargs = dict(conf.items('nginx'))
+            conf_dir      = kwargs.pop('config_directory')
+            link_conf_dir = kwargs.pop('link_config_directory', None)
+            command       = kwargs.pop('command', None)
+            conf_tmpl     = kwargs.pop('config_template', None)
+            nginx = Nginx(kwargs, conf_dir, link_conf_dir, command, conf_tmpl)
+            nginx.install()
+
+        if conf.has_section('firewall'):
+            kwargs = dict(conf.items('firewall'))
+            driver = kwargs.pop('driver')
+            firewall = Firewall(driver, kwargs)
+            firewall.install()
+
+        if conf.has_section('database'):
+            kwargs = dict(conf.items('database'))
+            driver = kwargs.pop('driver')
+            database = Database(driver, kwargs)
+            database.create()
+
+        print_step('Reload supervisor and nginx!')
+        [service.reload() for service in [supervisor, nginx] if service]
+
+    def uninstall(self):
+        """
+        Steps:
+        ======
+          * Parse supervisord directory from /etc/supervisord.conf
+          * Remove [APP].conf from [supervisord-dir]/programs/
+          * (optional) Remove config from nginx
+          * (optional) Remove config from firewall
+          * Database: do not do anything !!!
+          * Reload supervisord
+          * Reload nginx
+        """
+
+    def update(self):
+        """
+        Steps:
+        ======
+          * Parse supervisord directory from /etc/supervisord.conf
+          * Update [supervisord-dir]/programs/[APP].conf
+          * (if needed) Update config from nginx
+          * (if needed) Update config from firewall
+          * Database: ??? HOW ???
+          * (if needed) Reload supervisord
+          * (if needed) Reload nginx 
+        """
+
+class Supervisor(object):
     
-        location {{ location }} {
-            proxy_pass {{ proxy_pass }};
-        }
-    }
-    '''
-    filename = '%(server_name)s_%(listen)s.conf' % ngx_kwargs
-    file_path = os.path.join(directory, filename)
-    if tmpl_file:
-        with open(tmpl_file, 'r') as f:
-            ngx_tmpl = f.read()
-    jinja2.Template(ngx_tmpl).stream(**ngx_kwargs).dump(file_path)
+    def __init__(self, target):
+        self.target = target
 
-    if link_directory:
-        file_link = os.path.join(link_directory, filename)
+    @staticmethod
+    def get_directory(target=None, conf=None):
+        if not conf:
+            conf = parse_conf(target)
+        directory = None
+        for section, item in (('unix_http_server', 'file'), ('supervisord', 'pidfile')):
+            try:
+                sock_file = conf.get(section, item)
+                directory, _ = os.path.split(sock_file)
+                break
+            except ConfigParser.NoSectionError:
+                pass
+        if directory is None:
+            raise ValueError('Can not find the dealer directory!')
+        return directory
+        
+    # def get_directory(self):
+    #     return Supervisor.get_directory(self.target)
+
+    def get_programs(self):
+        conf = parse_conf(self.target)
+        programs = parse_programs(conf)
+        try:
+            files = conf.get('include', 'files')
+            s_path, s_name = os.path.split(self.target)
+            programs.extend(parse_include(s_path, files))
+        except ConfigParser.NoSectionError:
+            pass
+        return programs
+
+    def init(self, directory, source_tmpl):
+        """
+        Steps:
+        ======
+          * Create supervisord directories
+          * Write supervisord.conf to `args.target` (default: /etc/supervisord.conf)
+          * Start supervisord
+        """
+        programs_dir = os.path.join(directory, PROGRAMS_DIR)
+        print_step('Make dirs: %s' % programs_dir)
+        os.makedirs(programs_dir)
+    
+        print_step('Write supervisord.conf to %s' % self.target)
+        with open(source_tmpl, 'r') as f:
+            template = jinja2.Template(f.read())
+            template.stream(directory=directory).dump(self.target)
+    
+        print_step('Start supervisord')
+        os.system('supervisord -c {}'.format(self.target))
 
 
-def cfg_supervisor(): pass
-def cfg_firewall(): pass
+    def destory(self, directory=None):
+        """
+        Steps:
+        ======
+          * Uninstall all programs
+          * Shutdown supervisord
+          * Remove supervisord(dealer) directory
+          * Remove /etc/supervisord.conf
+        """
+        if not directory:
+            directory = Supervisor.get_directory(self.target)
+        if not os.path.exists(directory):
+            raise ValueError('Supervisord(dealer) directory %s not found!' % directory)
+        Permit('''
+        1. Shutdown supervisord;
+        2. remove supervisord(dealer) directory: {};
+        3. Remove supervisord config file: {}
+        >> ? '''.format(directory, self.target)).check()
+        print_step('Shutdown supervisord')
+        os.system('supervisorctl -c {} shutdown'.format(self.target))
+        
+        print_step('Remove supervisord(dealer) directory: %s' % directory)
+        os.system('rm -r {}'.format(directory))
+        
+        print_step('Remove supervisord config file: %s' % self.target)
+        os.remove(self.target)
 
-def decfg_nginx(): pass
-def decfg_firewall(): pass
-def decfg_supervisor(): pass
+    def install(self, prog_name, section):
+        conf = ConfigParser.RawConfigParser()
+        section_name = 'program:{}'.format(prog_name)
+        conf.add_section(section_name)
+        for key, value in section:
+            conf.set(section_name, key, value)
+            
+        directory = Supervisor.get_directory(self.target)
+        conf_path = os.path.join(directory, PROGRAMS_DIR, '{}.conf'.format(prog_name))
+        with open(conf_path, 'w') as fd:
+            conf.write(fd)
 
-# ==============================================================================
-#  Init databases
-# ==============================================================================
-def init_db_postgres(): pass
-def init_db_mysql(): pass
-def init_db_sqlite(): pass
-def init_db():
-    driver_map = {
-        'postgres' : init_db_postgres,
-        'mysql'    : init_db_mysql,
-        'sqlite'   : init_db_sqlite
-    }
+    def uninstall(self):
+        pass
+    def update(self):
+        pass
+
+    def reload(self):
+        os.system('supervisorctl -c {} update'.format(self.target))
 
 
+class Nginx(object):
+    def __init__(self, kwargs, conf_dir, link_conf_dir=None, command=None, conf_tmpl=None):
+        if not command:
+            commands = filter(os.path.exists, ['/sbin/nginx', '/bin/nginx',
+                                               '/usr/sbin/nginx', '/usr/bin/nginx',
+                                               '/usr/local/sbin/nginx', '/usr/local/bin/nginx'])
+            if commands:
+                defaults['command'] = commands[0]
+            else:
+                raise ValueError('Nginx not found!')
+        for key, value in (('listen'      , '80'),
+                           ('server_name' , '_'),
+                           ('location'    , '/')):
+            kwargs.setdefault(key, value)
+
+        self.kwargs = kwargs
+        self.conf_dir = conf_dir
+        self.link_conf_dir = link_conf_dir
+        self.command = command
+        self.conf_tmpl = conf_tmpl
+        
+    def install(self):
+        server_name_str = '-'.join(self.kwargs['server_name'].split())
+        filename = '{}-{}.conf'.format(server_name_str, self.kwargs['listen'])
+        file_path = os.path.join(self.conf_dir, filename)
+
+        ngx_tmpl = NGX_SERVER_TMPL
+        if self.conf_tmpl:
+            with open(self.conf_tmpl, 'r') as f:
+                ngx_tmpl = f.read()
+        jinja2.Template(ngx_tmpl).stream(**self.kwargs).dump(file_path)
+    
+        if self.link_conf_dir:
+            file_link = os.path.join(self.link_conf_dir, filename)
+            os.system('ln -s %(file_path)s %(file_link)s' % locals())
+    
+    def uninstall(self):
+        pass
+        
+    def update(self):
+        pass
+
+    def reload(self):
+        os.system('{} -s reload'.format(self.command))
+
+
+class Firewall(object):
+    def __init__(self, driver, kwargs):
+        pass
+    def install(self):
+        pass
+    def uninstall(self):
+        pass
+
+
+class Database(object):
+    def __init__(self, driver, kwargs): pass
+    def create(self): pass
+    def drop(self): pass
+    
 # ==============================================================================
 #  Main functions
 # ==============================================================================
@@ -173,113 +382,6 @@ def check_args(args):
         if not os.path.isfile(args.cfg):
             raise ValueError('Invalid config file: %s' % args.cfg)
 
-def get_dealer_dir(target):
-    conf = parse_conf(target)
-    dealer_dir = None
-    for section, item in (('unix_http_server', 'file'), ('supervisord', 'pidfile')):
-        try:
-            sock_file = conf.get(section, item)
-            dealer_dir, _ = os.path.split(sock_file)
-            break
-        except ConfigParser.NoSectionError:
-            pass
-    if dealer_dir is None:
-        raise ValueError('Can not find the dealer directory!')
-    return dealer_dir
-
-
-def init(args):
-    """
-    Steps:
-    ======
-      * Create supervisord directories
-      * Write supervisord.conf to `args.target` (default: /etc/supervisord.conf)
-      * Start supervisord
-    """
-    supervisord_dir = os.path.join(args.dir, 'programs')
-    print_step('Make dirs: %s' % supervisord_dir)
-    os.makedirs(supervisord_dir)
-
-    print_step('Write supervisord.conf to %s' % args.target)
-    with open(args.cfg, 'r') as f:
-        template = jinja2.Template(f.read())
-        template.stream(dir=args.dir).dump(args.target)
-
-    print_step('Start supervisord')
-    os.system('supervisord -c {}'.format(args.target))
-
-
-def destory(args):
-    """
-    Steps:
-    ======
-      * Uninstall all programs
-      * Shutdown supervisord
-      * Remove dealer directory
-      * Remove /etc/supervisord.conf
-    """
-    dealer_dir = get_dealer_dir(args.target)
-    if not os.path.exists(dealer_dir):
-        raise ValueError('Dealer directory %s not found!' % dealer_dir)
-    Permit('''    1. Shutdown supervisord;
-    2. remove dealer directory: {};
-    3. Remove supervisord config file: {}
-    >> ? '''.format(dealer_dir, args.target)).check()
-    print_step('Shutdown supervisord')
-    os.system('supervisorctl -c {} shutdown'.format(args.target))
-    
-    print_step('Remove dealer directory: %s' % dealer_dir)
-    os.system('rm -r {}'.format(dealer_dir))
-    
-    print_step('Remove supervisord config file: %s' % args.target)
-    os.remove(args.target)
-
-
-def install(args):
-    """
-    Steps:
-    ======
-      * Parse supervisord directory from /etc/supervisord.conf
-      * Copy [APP].conf to [supervisord-dir]/programs/
-      * (optional) Add config to nginx
-      * (optional) Add config to firewall
-      * (optional) Init database: create database, create tables, other SQL.
-      * Reload supervisord
-      * Reload nginx
-    """
-    conf = parse_conf(args.target)
-    
-
-
-def uninstall(args):
-    """
-    Steps:
-    ======
-      * Parse supervisord directory from /etc/supervisord.conf
-      * Remove [APP].conf from [supervisord-dir]/programs/
-      * (optional) Remove config from nginx
-      * (optional) Remove config from firewall
-      * Database: do not do anything !!!
-      * Reload supervisord
-      * Reload nginx
-    """
-    pass
-
-
-def update(args):
-    """
-    Steps:
-    ======
-      * Parse supervisord directory from /etc/supervisord.conf
-      * Update [supervisord-dir]/programs/[APP].conf
-      * (if needed) Update config from nginx
-      * (if needed) Update config from firewall
-      * Database: ??? HOW ???
-      * (if needed) Reload supervisord
-      * (if needed) Reload nginx 
-    """
-    pass
-
 
 def main():
     args = parse_args()
@@ -288,7 +390,7 @@ def main():
     assert getpass.getuser() == 'root', 'Permission denied!'
     try:
         check_args(args)
-        globals()[args.action](args)
+        Dealer(args.action, args).process()
         print '='*40
         print '>>> DONE!'
     except ValueError as e:
