@@ -9,6 +9,7 @@ import ConfigParser
 
 import jinja2
 
+
 PROGRAMS_DIR = 'programs'
 NGX_SERVER_TMPL = '''
 server {
@@ -34,7 +35,8 @@ def parse_args():
     parser_init.add_argument('-c', '--cfg', metavar='FILE', required=True, help='Supervisord config file(template) path.')
     parser_init.add_argument('-d', '--dir', metavar='DIR', required=True, help='Where you place dealer files.')
     parser_destory.add_argument('-d', '--dir', metavar='DIR', default=None, help='(optional) Where you place dealer files.')
-        
+    parser_uninstall.add_argument('--drop', metavar='y/n', choices=['y', 'n'], default='n', help='If should drop database, default: NO')
+
     for p in (parser_install, parser_uninstall, parser_update):
         p.add_argument('-c', '--cfg', metavar='FILE', required=True, help='Program config file path.')
     
@@ -44,6 +46,7 @@ def parse_args():
 
     args = parser.parse_args()
     return args
+
 
 class Permit(object):
     """ Ask the user whether can continue actions.
@@ -85,6 +88,20 @@ class Permit(object):
 def print_step(msg):
     print '  * .... %s' % msg
     
+def check_path(path, should_dir=False, should_exists=False):
+    path_exists = os.path.exists(path)
+    path_is_dir = os.path.isdir(path)
+
+    if should_dir and not path_is_dir:
+        raise ValueError('Path is not directory: {}'.format(path))
+    elif not should_dir and path_is_dir:
+        raise ValueError('Path is directory: {}'.format(path))
+    
+    if should_exists and not path_exists:
+        raise ValueError('Path not exists: {}'.format(path))
+    elif not should_exists and path_exists:
+        raise ValueError('Path already exists: {}'.format(path))
+    
 # ==============================================================================
 #  ConfigParser stuffs
 # ==============================================================================
@@ -107,7 +124,6 @@ def parse_conf(path):
     conf.read(path)
     return conf
 
-
 # ==============================================================================
 #  Config (nginx, supervisor, firewall) things.
 # ==============================================================================
@@ -119,6 +135,7 @@ class Dealer(object):
 
     def process(self):
         conf = parse_conf(self.args.target)
+        print_step('Started')
         getattr(self, self.action)()
 
     def init(self):
@@ -134,12 +151,10 @@ class Dealer(object):
         Steps:
         ======
           * Parse supervisord directory from /etc/supervisord.conf
-          * Copy [APP].conf to [supervisord-dir]/programs/
-          * (optional) Add config to nginx
-          * (optional) Add config to firewall
+          * Install program to supervisord
+          * (optional) Install to nginx
+          * (optional) Install to firewall
           * (optional) Init database: create database, create tables, other SQL.
-          * Reload supervisord
-          * Reload nginx
         """
         conf = parse_conf(self.args.cfg)
         prog_name = parse_programs(conf)[0]
@@ -147,7 +162,6 @@ class Dealer(object):
         supervisor = Supervisor(self.args.target)
         supervisor.install(prog_name, section_program)
 
-        nginx, firewall, database = None, None, None
         if conf.has_section('nginx'):
             kwargs = dict(conf.items('nginx'))
             conf_dir      = kwargs.pop('config_directory')
@@ -169,21 +183,40 @@ class Dealer(object):
             database = Database(driver, kwargs)
             database.create()
 
-        print_step('Reload supervisor and nginx!')
-        [service.reload() for service in [supervisor, nginx] if service]
-
     def uninstall(self):
         """
         Steps:
         ======
           * Parse supervisord directory from /etc/supervisord.conf
-          * Remove [APP].conf from [supervisord-dir]/programs/
-          * (optional) Remove config from nginx
-          * (optional) Remove config from firewall
-          * Database: do not do anything !!!
-          * Reload supervisord
-          * Reload nginx
+          * Uninstall program from supervisord
+          * (optional) Uninstall from nginx
+          * (optional) Uninstall from firewall
+          * Database: you can drop the database if you want !!!
         """
+        conf = parse_conf(self.args.cfg)
+        prog_name = parse_programs(conf)[0]
+        supervisor = Supervisor(self.args.target)
+        supervisor.uninstall(prog_name)
+        
+        if conf.has_section('nginx'):
+            kwargs = dict(conf.items('nginx'))
+            conf_dir      = kwargs.pop('config_directory')
+            link_conf_dir = kwargs.pop('link_config_directory', None)
+            command       = kwargs.pop('command', None)
+            nginx = Nginx(kwargs, conf_dir, link_conf_dir, command)
+            nginx.uninstall()
+
+        if conf.has_section('firewall'):
+            kwargs = dict(conf.items('firewall'))
+            driver = kwargs.pop('driver')
+            firewall = Firewall(driver, kwargs)
+            firewall.uninstall()
+
+        if conf.has_section('database') and self.args.drop.lower() == 'y':
+            kwargs = dict(conf.items('database'))
+            driver = kwargs.pop('driver')
+            database = Database(driver, kwargs)
+            database.drop()
 
     def update(self):
         """
@@ -253,7 +286,6 @@ class Supervisor(object):
         print_step('Start supervisord')
         os.system('supervisord -c {}'.format(self.target))
 
-
     def destory(self, directory=None):
         """
         Steps:
@@ -265,8 +297,7 @@ class Supervisor(object):
         """
         if not directory:
             directory = Supervisor.get_directory(self.target)
-        if not os.path.exists(directory):
-            raise ValueError('Supervisord(dealer) directory %s not found!' % directory)
+        check_path(directory, should_dir=True, should_exists=True)
         Permit('''
         1. Shutdown supervisord;
         2. remove supervisord(dealer) directory: {};
@@ -282,23 +313,45 @@ class Supervisor(object):
         os.remove(self.target)
 
     def install(self, prog_name, section):
+        directory = Supervisor.get_directory(self.target)
+        conf_path = os.path.join(directory, PROGRAMS_DIR, '{}.conf'.format(prog_name))
+        check_path(conf_path, should_exists=False)
         conf = ConfigParser.RawConfigParser()
         section_name = 'program:{}'.format(prog_name)
         conf.add_section(section_name)
         for key, value in section:
             conf.set(section_name, key, value)
             
-        directory = Supervisor.get_directory(self.target)
-        conf_path = os.path.join(directory, PROGRAMS_DIR, '{}.conf'.format(prog_name))
+        print_step('Write supervisord config file to: {}'.format(conf_path))
         with open(conf_path, 'w') as fd:
             conf.write(fd)
+        self.reload()
 
-    def uninstall(self):
-        pass
+    def uninstall(self, prog_name):
+        """
+        Steps:
+        ======
+          * Stop the program
+          * Remove [app-dealer]/programs/[app].conf file
+        """
+        directory = Supervisor.get_directory(self.target)
+        conf_path = os.path.join(directory, PROGRAMS_DIR, '{}.conf'.format(prog_name))
+        check_path(conf_path, should_exists=True)
+        self.stop(prog_name)
+        print_step('Remove supervisord config file: {}'.format(conf_path))
+        os.remove(conf_path)
+        self.reload()
+
     def update(self):
         pass
 
+    def stop(self, marker):
+        """ marker = {[program], all} """
+        print_step('Supervisor stop: {}'.format(marker))
+        os.system('supervisorctl -c {} stop {}'.format(self.target, marker))
+
     def reload(self):
+        print_step('Update supervisord for config change')
         os.system('supervisorctl -c {} update'.format(self.target))
 
 
@@ -322,29 +375,48 @@ class Nginx(object):
         self.link_conf_dir = link_conf_dir
         self.command = command
         self.conf_tmpl = conf_tmpl
+
+    @property
+    def conf_filename(self):
+        server_name_str = '-'.join(self.kwargs['server_name'].split())
+        return '{}-{}.conf'.format(server_name_str, self.kwargs['listen'])
         
     def install(self):
-        server_name_str = '-'.join(self.kwargs['server_name'].split())
-        filename = '{}-{}.conf'.format(server_name_str, self.kwargs['listen'])
+        filename = self.conf_filename
         file_path = os.path.join(self.conf_dir, filename)
-
+        check_path(file_path, should_exists=False)
+        
         ngx_tmpl = NGX_SERVER_TMPL
         if self.conf_tmpl:
+            print_step('Read nginx config template from: {}'.format(self.conf_tmpl))
             with open(self.conf_tmpl, 'r') as f:
                 ngx_tmpl = f.read()
+        print_step('Write nginx config file to: {}'.format(file_path))
         jinja2.Template(ngx_tmpl).stream(**self.kwargs).dump(file_path)
     
         if self.link_conf_dir:
             file_link = os.path.join(self.link_conf_dir, filename)
-            os.system('ln -s %(file_path)s %(file_link)s' % locals())
+            print_step('Make symbol link to: {}'.format(file_link))
+            os.symlink(file_path, file_link)
+        self.reload()
     
     def uninstall(self):
-        pass
+        filename = self.conf_filename
+        file_path = os.path.join(self.conf_dir, filename)
+        check_path(file_path, should_exists=True)
+        print_step('Remove nginx config file: {}'.format(file_path))
+        os.remove(file_path)
+        if self.link_conf_dir:
+            file_link = os.path.join(self.link_conf_dir, filename)
+            print_step('Unlink symbol link: {}'.format(file_link))
+            os.unlink(file_link)
+        self.reload()
         
     def update(self):
         pass
 
     def reload(self):
+        print_step('Reload nginx')
         os.system('{} -s reload'.format(self.command))
 
 
@@ -355,7 +427,6 @@ class Firewall(object):
         pass
     def uninstall(self):
         pass
-
 
 class Database(object):
     def __init__(self, driver, kwargs): pass
@@ -382,16 +453,15 @@ def check_args(args):
         if not os.path.isfile(args.cfg):
             raise ValueError('Invalid config file: %s' % args.cfg)
 
-
 def main():
     args = parse_args()
     print args
-    print '='*40
+    print '='*72
     assert getpass.getuser() == 'root', 'Permission denied!'
     try:
         check_args(args)
         Dealer(args.action, args).process()
-        print '='*40
+        print '='*72
         print '>>> DONE!'
     except ValueError as e:
         print '[ERROR] :: %r' % e
