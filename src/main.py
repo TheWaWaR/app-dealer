@@ -3,7 +3,9 @@
 
 import os
 import sys
+import json
 import getpass
+import commands
 import argparse
 import ConfigParser
 
@@ -11,6 +13,7 @@ import jinja2
 
 
 PROGRAMS_DIR = 'programs'
+SOURCES_DIR = 'sources'
 NGX_SERVER_TMPL = '''
 server {
     listen       {{ listen }};
@@ -31,16 +34,20 @@ def parse_args():
     parser_install   = subparsers.add_parser('install', help='Install the application')
     parser_uninstall = subparsers.add_parser('uninstall', help='Uninstall the application')
     parser_update    = subparsers.add_parser('update', help='Update the application')
+    parser_status    = subparsers.add_parser('status', help='Show application status')
 
     parser_init.add_argument('-c', '--cfg', metavar='FILE', required=True, help='Supervisord config file(template) path.')
     parser_init.add_argument('-d', '--dir', metavar='DIR', required=True, help='Where you place dealer files.')
     parser_destory.add_argument('-d', '--dir', metavar='DIR', default=None, help='(optional) Where you place dealer files.')
+    parser_uninstall.add_argument('-p', '--prog_name', metavar='STRING', required=True, help='Specific by program name')
+    # parser_uninstall.add_argument('-c', '--cfg', metavar='FILE', help='Program config file path.')
     parser_uninstall.add_argument('--drop', metavar='y/n', choices=['y', 'n'], default='n', help='If should drop database, default: NO')
+    parser_status.add_argument('-m', '--marker', metavar='[program]/all', default='all', help='Show application status')
 
-    for p in (parser_install, parser_uninstall, parser_update):
+    for p in (parser_install, parser_update):
         p.add_argument('-c', '--cfg', metavar='FILE', required=True, help='Program config file path.')
     
-    for p in (parser_init, parser_destory, parser_install, parser_uninstall, parser_update):
+    for p in (parser_init, parser_destory, parser_install, parser_uninstall, parser_update, parser_status):
         p.add_argument('-t', '--target', metavar='FILE', default='/etc/supervisord.conf',
                        help='(optional) Target global supervisord config file')
 
@@ -61,12 +68,8 @@ class Permit(object):
     def __init__(self, msg):
         self.msg = msg
 
-    @staticmethod
-    def reset():
-        Permit.last = None
-
     def reset(self):
-        Permit.reset()
+        Permit.last = None
 
     def check(self, y=True, n=True, All=False):
         if Permit.last == 'a':
@@ -85,8 +88,13 @@ class Permit(object):
         Permit.last = answer
 
 
-def print_step(msg):
-    print '  * .... %s' % msg
+def print_step(msg, level=1):
+    format_dict = {
+        0 : ' * %s',
+        1 : '  * .. %s',
+        2 : '   * .... %s',
+    }
+    print format_dict[level] % msg
     
 def check_path(path, should_dir=False, should_exists=False):
     path_exists = os.path.exists(path)
@@ -134,8 +142,8 @@ class Dealer(object):
         self.args = args
 
     def process(self):
-        conf = parse_conf(self.args.target)
-        print_step('Started')
+        # conf = parse_conf(self.args.target)
+        print_step('>>> Started')
         getattr(self, self.action)()
 
     def init(self):
@@ -144,26 +152,41 @@ class Dealer(object):
 
     def destory(self):
         """ See: Supervisor.destory() """
-        Supervisor(self.args.target).destory(self.args.dir)
+        dealer_dir = Supervisor.get_directory(target=self.args.target)
+        sources_dir = os.path.join(dealer_dir, SOURCES_DIR)
+        for prog_cfg_name in os.listdir(sources_dir):
+            prog_name = prog_cfg_name.rsplit('.', 1)[0]
+            args = argparse.Namespace(target=self.args.target, prog_name=prog_name)
+            print_step('Uninstall program {}'.format(prog_name), level=0)
+            Dealer('uninstall', args).uninstall()
+        print_step('Destory supervisor', level=0)
+        Supervisor(self.args.target).destory()
 
     def install(self):
         """
         Steps:
         ======
           * Parse supervisord directory from /etc/supervisord.conf
+          * Copy [app].conf to [dealer-dir]/sources/
           * Install program to supervisord
           * (optional) Install to nginx
           * (optional) Install to firewall
           * (optional) Init database: create database, create tables, other SQL.
         """
-        conf = parse_conf(self.args.cfg)
-        prog_name = parse_programs(conf)[0]
-        section_program = conf.items('program:{}'.format(prog_name))
+        prog_conf = parse_conf(self.args.cfg)
+        prog_name = parse_programs(prog_conf)[0]
+
+        dealer_dir = Supervisor.get_directory(target=self.args.target)
+        src_cfg_path = os.path.join(dealer_dir, SOURCES_DIR, '{}.conf'.format(prog_name))
+        print_step('Copy dealer file: {} ==> {}'.format(self.args.cfg, src_cfg_path))
+        os.system('cp {} {}'.format(self.args.cfg, src_cfg_path))
+        
+        section_program = prog_conf.items('program:{}'.format(prog_name))
         supervisor = Supervisor(self.args.target)
         supervisor.install(prog_name, section_program)
 
-        if conf.has_section('nginx'):
-            kwargs = dict(conf.items('nginx'))
+        if prog_conf.has_section('nginx'):
+            kwargs = dict(prog_conf.items('nginx'))
             conf_dir      = kwargs.pop('config_directory')
             link_conf_dir = kwargs.pop('link_config_directory', None)
             command       = kwargs.pop('command', None)
@@ -171,14 +194,14 @@ class Dealer(object):
             nginx = Nginx(kwargs, conf_dir, link_conf_dir, command, conf_tmpl)
             nginx.install()
 
-        if conf.has_section('firewall'):
-            kwargs = dict(conf.items('firewall'))
+        if prog_conf.has_section('firewall'):
+            kwargs = dict(prog_conf.items('firewall'))
             driver = kwargs.pop('driver')
             firewall = Firewall(driver, kwargs)
             firewall.install()
 
-        if conf.has_section('database'):
-            kwargs = dict(conf.items('database'))
+        if prog_conf.has_section('database'):
+            kwargs = dict(prog_conf.items('database'))
             driver = kwargs.pop('driver')
             database = Database(driver, kwargs)
             database.create()
@@ -193,30 +216,37 @@ class Dealer(object):
           * (optional) Uninstall from firewall
           * Database: you can drop the database if you want !!!
         """
-        conf = parse_conf(self.args.cfg)
-        prog_name = parse_programs(conf)[0]
+        dealer_dir = Supervisor.get_directory(target=self.args.target)
+        src_cfg_path = os.path.join(dealer_dir, SOURCES_DIR, '{}.conf'.format(self.args.prog_name))
+        if not os.path.exists(src_cfg_path):
+            raise ValueError('Source dealer config file not exists: {}'.format(src_cfg_path))
+
+        prog_conf = parse_conf(src_cfg_path)
         supervisor = Supervisor(self.args.target)
-        supervisor.uninstall(prog_name)
+        supervisor.uninstall(self.args.prog_name)
         
-        if conf.has_section('nginx'):
-            kwargs = dict(conf.items('nginx'))
+        if prog_conf.has_section('nginx'):
+            kwargs = dict(prog_conf.items('nginx'))
             conf_dir      = kwargs.pop('config_directory')
             link_conf_dir = kwargs.pop('link_config_directory', None)
             command       = kwargs.pop('command', None)
             nginx = Nginx(kwargs, conf_dir, link_conf_dir, command)
             nginx.uninstall()
 
-        if conf.has_section('firewall'):
-            kwargs = dict(conf.items('firewall'))
+        if prog_conf.has_section('firewall'):
+            kwargs = dict(prog_conf.items('firewall'))
             driver = kwargs.pop('driver')
             firewall = Firewall(driver, kwargs)
             firewall.uninstall()
 
-        if conf.has_section('database') and self.args.drop.lower() == 'y':
-            kwargs = dict(conf.items('database'))
+        if prog_conf.has_section('database') and self.args.drop.lower() == 'y':
+            kwargs = dict(prog_conf.items('database'))
             driver = kwargs.pop('driver')
             database = Database(driver, kwargs)
             database.drop()
+
+        print_step('Remove program config file: {}'.format(src_cfg_path))
+        os.remove(src_cfg_path)
 
     def update(self):
         """
@@ -231,6 +261,22 @@ class Dealer(object):
           * (if needed) Reload nginx 
         """
 
+    def status(self):
+        dealer_dir = Supervisor.get_directory(target=self.args.target)
+        progs_dir = os.path.join(dealer_dir, PROGRAMS_DIR)
+        if self.args.marker == 'all':
+            print 'Programs: {%s}' % ', '.join([prog_file.rsplit('.', 1)[0]
+                                                for prog_file in os.listdir(progs_dir)])
+        else:
+            prog_conf_file = os.path.join(progs_dir, '{}.conf'.format(self.args.marker))
+            conf = parse_conf(prog_conf_file)
+            print json.dumps(dict([(sec, dict(conf.items(sec)))
+                                   for sec in conf.sections()]), indent=4)
+        print '-' * 72
+        supervisor = Supervisor(self.args.target)
+        supervisor.status(self.args.marker)
+
+
 class Supervisor(object):
     
     def __init__(self, target):
@@ -238,6 +284,8 @@ class Supervisor(object):
 
     @staticmethod
     def get_directory(target=None, conf=None):
+        """ The supervisord directory actually dealer directory. """
+        
         if not conf:
             conf = parse_conf(target)
         directory = None
@@ -251,9 +299,6 @@ class Supervisor(object):
         if directory is None:
             raise ValueError('Can not find the dealer directory!')
         return directory
-        
-    # def get_directory(self):
-    #     return Supervisor.get_directory(self.target)
 
     def get_programs(self):
         conf = parse_conf(self.target)
@@ -275,8 +320,10 @@ class Supervisor(object):
           * Start supervisord
         """
         programs_dir = os.path.join(directory, PROGRAMS_DIR)
-        print_step('Make dirs: %s' % programs_dir)
+        sources_dir = os.path.join(directory, SOURCES_DIR)
+        print_step('Make dirs: {}, {}'.format(programs_dir, sources_dir))
         os.makedirs(programs_dir)
+        os.makedirs(sources_dir)
     
         print_step('Write supervisord.conf to %s' % self.target)
         with open(source_tmpl, 'r') as f:
@@ -286,7 +333,7 @@ class Supervisor(object):
         print_step('Start supervisord')
         os.system('supervisord -c {}'.format(self.target))
 
-    def destory(self, directory=None):
+    def destory(self):
         """
         Steps:
         ======
@@ -295,8 +342,7 @@ class Supervisor(object):
           * Remove supervisord(dealer) directory
           * Remove /etc/supervisord.conf
         """
-        if not directory:
-            directory = Supervisor.get_directory(self.target)
+        directory = Supervisor.get_directory(self.target)
         check_path(directory, should_dir=True, should_exists=True)
         Permit('''
         1. Shutdown supervisord;
@@ -350,6 +396,9 @@ class Supervisor(object):
         print_step('Supervisor stop: {}'.format(marker))
         os.system('supervisorctl -c {} stop {}'.format(self.target, marker))
 
+    def status(self, marker):
+        os.system('supervisorctl -c {} status {}'.format(self.target, marker))
+        
     def reload(self):
         print_step('Update supervisord for config change')
         os.system('supervisorctl -c {} update'.format(self.target))
@@ -448,10 +497,6 @@ def check_args(args):
     if args.action == 'destory':
         if not os.path.exists(args.target):
             raise ValueError('Target file %s not found' % args.target)
-
-    if args.action in ('init', 'install', 'uninstall', 'update'):
-        if not os.path.isfile(args.cfg):
-            raise ValueError('Invalid config file: %s' % args.cfg)
 
 def main():
     args = parse_args()
