@@ -58,10 +58,13 @@ def parse_args():
 class Permit(object):
     """ Ask the user whether can continue actions.
     
-    Example:
+    Use Case:
     ========
        $ Can I continue doing things? [Y/N/A]:
-    
+
+    Example:
+    ========
+       >> Permit('Can I continue doing things?', All=True).check()
     """
     last = None
     
@@ -151,7 +154,12 @@ class Dealer(object):
         Supervisor(self.args.target).init(self.args.dir, self.args.cfg)
 
     def destory(self):
-        """ See: Supervisor.destory() """
+        """
+        Steps:
+        ======
+          * Uninstall all programs
+          * Supervisor.destory()
+        """
         dealer_dir = Supervisor.get_directory(target=self.args.target)
         sources_dir = os.path.join(dealer_dir, SOURCES_DIR)
         for prog_cfg_name in os.listdir(sources_dir):
